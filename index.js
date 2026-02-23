@@ -1,12 +1,7 @@
-// API Manager - Central Key Management Service
-// Deploy to: https://api.crawdbot.com
-// All droplets fetch keys via this API, no hardcoded keys
+// API Manager - Vercel Serverless Version
+// Central key management for OpenClaw agents
 
-const express = require('express');
 const crypto = require('crypto');
-
-const app = express();
-app.use(express.json());
 
 // In-memory key store (in production, use encrypted database)
 const keys = {
@@ -45,7 +40,6 @@ function rotateKey(provider) {
   if (!shouldRotate(provider)) return keys[provider];
   
   console.log(`Rotating ${provider} key...`);
-  
   // In production, fetch from secure vault
   // For now, use environment backup
   const backupKey = process.env[`${provider.toUpperCase()}_BACKUP_KEY`];
@@ -64,114 +58,131 @@ function rotateKey(provider) {
   return keys[provider];
 }
 
-// API: Get key for provider
-app.get('/keys/:provider', (req, res) => {
-  const { provider } = req.params;
+// Main handler (Vercel serverless)
+export default async function handler(req, res) {
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   
-  if (!keys[provider]) {
-    return res.status(404).json({ error: 'Provider not found' });
+  // Handle OPTIONS
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
-  
-  // Auto-rotate if needed
-  const key = rotateKey(provider);
-  
-  res.json({
-    provider,
-    key,
-    rotation: {
-      last: new Date(usage[provider].lastRotation).toISOString(),
-      next: usage[provider].resetAt || 'not scheduled'
-    }
-  });
-  
-  // Log access
-  console.log(`[${new Date().toISOString()}] Key fetched: ${provider} by ${req.ip || 'unknown'}`);
-});
 
-// API: Report usage
-app.post('/keys/:provider/usage', (req, res) => {
-  const { provider } = req.params;
-  const { tokens, droplet, timestamp } = req.body;
-  
-  if (!usage[provider]) {
-    return res.status(404).json({ error: 'Provider not found' });
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const path = url.pathname;
+    const method = req.method;
+    
+    // GET /health
+    if (path === '/health' && method === 'GET') {
+      return res.json({
+        status: 'ok',
+        providers: Object.keys(keys),
+        totalUsage: {
+          zai: usage.zai.count,
+          anthropic: usage.anthropic.count,
+          google: usage.google.count,
+          openai: usage.openai.count
+        }
+      });
+    }
+    
+    // GET /keys/:provider
+    const keyMatch = path.match(/^\/keys\/([a-z]+)$/);
+    if (keyMatch && method === 'GET') {
+      const provider = keyMatch[1];
+      
+      if (!keys[provider]) {
+        return res.status(404).json({ error: 'Provider not found' });
+      }
+      
+      // Auto-rotate if needed
+      const key = rotateKey(provider);
+      
+      return res.json({
+        provider,
+        key,
+        rotation: {
+          last: new Date(usage[provider].lastRotation).toISOString(),
+          next: usage[provider].resetAt || 'not scheduled'
+        }
+      });
+    }
+    
+    // POST /keys/:provider/usage
+    const usageMatch = path.match(/^\/keys\/([a-z]+)\/usage$/);
+    if (usageMatch && method === 'POST') {
+      const provider = usageMatch[1];
+      
+      if (!usage[provider]) {
+        return res.status(404).json({ error: 'Provider not found' });
+      }
+      
+      // Parse body
+      const body = await parseBody(req);
+      const { tokens, droplet, timestamp } = body;
+      
+      usage[provider].count += tokens || 0;
+      
+      return res.json({ 
+        success: true,
+        provider,
+        totalUsage: usage[provider].count,
+        droplet
+      });
+    }
+    
+    // POST /keys/:provider/rotate
+    const rotateMatch = path.match(/^\/keys\/([a-z]+)\/rotate$/);
+    if (rotateMatch && method === 'POST') {
+      const provider = rotateMatch[1];
+      
+      if (!keys[provider]) {
+        return res.status(404).json({ error: 'Provider not found' });
+      }
+      
+      const newKey = rotateKey(provider);
+      
+      return res.json({
+        success: true,
+        provider,
+        newKey: newKey.substring(0, 20) + '...',
+        rotatedAt: new Date().toISOString()
+      });
+    }
+    
+    // GET /keys (admin)
+    if (path === '/keys' && method === 'GET') {
+      return res.json({
+        providers: Object.keys(keys),
+        rotationSchedule: {
+          zai: '5 hours',
+          others: 'manual'
+        }
+      });
+    }
+    
+    // 404
+    return res.status(404).json({ error: 'Not found' });
+    
+  } catch (error) {
+    console.error('Error:', error);
+    return res.status(500).json({ error: error.message });
   }
-  
-  usage[provider].count += tokens || 0;
-  
-  res.json({ 
-    success: true,
-    provider,
-    totalUsage: usage[provider].count,
-    droplet
+}
+
+async function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch (e) {
+        reject(e);
+      }
+    });
   });
-  
-  console.log(`[${timestamp}] Usage reported: ${provider} ${tokens} tokens by ${droplet}`);
-});
-
-// API: Get usage stats
-app.get('/keys/:provider/usage', (req, res) => {
-  const { provider } = req.params;
-  
-  if (!usage[provider]) {
-    return res.status(404).json({ error: 'Provider not found' });
-  }
-  
-  res.json({
-    provider,
-    totalUsage: usage[provider].count,
-    lastRotation: new Date(usage[provider].lastRotation).toISOString(),
-    nextRotation: usage[provider].resetAt || 'not scheduled'
-  });
-});
-
-// API: Get all keys (admin only)
-app.get('/keys', (req, res) => {
-  // In production, add admin authentication
-  res.json({
-    providers: Object.keys(keys),
-    rotationSchedule: {
-      zai: '5 hours',
-      others: 'manual'
-    }
-  });
-});
-
-// API: Rotate key manually
-app.post('/keys/:provider/rotate', (req, res) => {
-  const { provider } = req.params;
-  
-  const newKey = rotateKey(provider);
-  
-  res.json({
-    success: true,
-    provider,
-    newKey: newKey.substring(0, 20) + '...',
-    rotatedAt: new Date().toISOString()
-  });
-  
-  console.log(`[MANUAL] Rotated ${provider} key`);
-});
-
-// API: Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    providers: Object.keys(keys),
-    totalUsage: {
-      zai: usage.zai.count,
-      anthropic: usage.anthropic.count,
-      google: usage.google.count,
-      openai: usage.openai.count
-    }
-  });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`API Key Manager running on port ${PORT}`);
-  console.log(`Providers: ${Object.keys(keys).join(', ')}`);
-  console.log(`Rotation: Z.AI every 5 hours`);
-});
-
-module.exports = app;
+}
