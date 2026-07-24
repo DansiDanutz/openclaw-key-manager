@@ -1,12 +1,9 @@
 {
   "name": "api-manager",
   "version": "1.0.0",
-  "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "node index.js",
+    "test": "node --test",
     "deploy": "vercel --prod"
-  },
-  "dependencies": {
-    "express": "^4.18.2"
   }
 }

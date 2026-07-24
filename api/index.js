@@ -1,145 +1,115 @@
-// API Manager - Single Vercel Function
-// Central key management for OpenClaw agents
+import { timingSafeEqual } from 'node:crypto'
 
-const crypto = require('crypto');
+const PROVIDERS = new Set(['zai', 'anthropic', 'google', 'openai'])
+const MAX_BODY_BYTES = 4096
 
-// Keys (in production, use encrypted database)
-const keys = {
-  zai: process.env.ZAI_KEY || '6255260d9af848e59b3dea57feb4096d.8ragfHsLnBbBSoFh',
-  anthropic: process.env.ANTHROPIC_KEY || '',
-  google: process.env.GOOGLE_KEY || '',
-  openai: process.env.OPENAI_KEY || ''
-};
-
-// Usage tracking
-const usage = {
-  zai: { count: 0, lastRotation: Date.now(), resetAt: getNextRotation() },
-  anthropic: { count: 0, lastRotation: Date.now() },
-  google: { count: 0 },
-  openai: { count: 0 }
-};
-
-function getNextRotation() {
-  const now = new Date();
-  const next = new Date(now.getTime() + 5 * 60 * 60 * 1000);
-  return next.toISOString();
+function configuredOrigins() {
+  return new Set(
+    (process.env.KEY_MANAGER_ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  )
 }
 
-function shouldRotate(provider) {
-  if (provider === 'zai') {
-    const resetTime = new Date(usage.zai.resetAt);
-    return new Date() >= resetTime;
+function applyCors(req, res) {
+  const origin = req.headers.origin
+  if (!origin || !configuredOrigins().has(origin)) return false
+
+  res.setHeader('Access-Control-Allow-Origin', origin)
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  res.setHeader('Vary', 'Origin')
+  return true
+}
+
+function authenticate(req, res) {
+  const expected = process.env.KEY_MANAGER_ADMIN_TOKEN
+  if (!expected) {
+    res.status(503).json({ error: 'service unavailable' })
+    return false
   }
-  return false;
+
+  const header = req.headers.authorization || ''
+  const supplied = header.startsWith('Bearer ') ? header.slice(7) : ''
+  const expectedBuffer = Buffer.from(expected)
+  const suppliedBuffer = Buffer.from(supplied)
+  const valid = expectedBuffer.length === suppliedBuffer.length
+    && timingSafeEqual(expectedBuffer, suppliedBuffer)
+
+  if (!valid) {
+    res.status(401).json({ error: 'unauthorized' })
+    return false
+  }
+  return true
 }
 
-function rotateKey(provider) {
-  if (!shouldRotate(provider)) return keys[provider];
-  
-  const backupKey = process.env[`${provider.toUpperCase()}_BACKUP_KEY`];
-  if (backupKey) {
-    keys[provider] = backupKey;
-    usage[provider].lastRotation = Date.now();
-    if (provider === 'zai') {
-      usage[provider].resetAt = getNextRotation();
+function providerKey(provider) {
+  return process.env[`${provider.toUpperCase()}_KEY`] || ''
+}
+
+async function readJson(req) {
+  let body = ''
+  for await (const chunk of req) {
+    body += chunk
+    if (Buffer.byteLength(body) > MAX_BODY_BYTES) {
+      throw new Error('payload too large')
     }
   }
-  return keys[provider];
+  return JSON.parse(body || '{}')
 }
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  
+  const corsAllowed = applyCors(req, res)
   if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+    return corsAllowed
+      ? res.status(204).end()
+      : res.status(403).json({ error: 'origin not allowed' })
   }
-  
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const path = url.pathname;
-    const method = req.method;
-    
-    // GET /health
-    if (path === '/health' && method === 'GET') {
-      return res.json({
-        status: 'ok',
-        providers: Object.keys(keys),
-        totalUsage: {
-          zai: usage.zai.count,
-          anthropic: usage.anthropic.count,
-          google: usage.google.count,
-          openai: usage.openai.count
-        }
-      });
-    }
-    
-    // GET /keys/:provider
-    const keyMatch = path.match(/^\/keys\/([a-z]+)$/);
-    if (keyMatch && method === 'GET') {
-      const provider = keyMatch[1];
-      if (!keys[provider]) {
-        return res.status(404).json({ error: 'Provider not found' });
-      }
-      const key = rotateKey(provider);
-      return res.json({
-        provider,
-        key,
-        rotation: {
-          last: new Date(usage[provider].lastRotation).toISOString(),
-          next: usage[provider].resetAt || 'not scheduled'
-        }
-      });
-    }
-    
-    // POST /keys/:provider/usage
-    const usageMatch = path.match(/^\/keys\/([a-z]+)\/usage$/);
-    if (usageMatch && method === 'POST') {
-      const provider = usageMatch[1];
-      if (!usage[provider]) {
-        return res.status(404).json({ error: 'Provider not found' });
-      }
-      const body = await parseBody(req);
-      usage[provider].count += body.tokens || 0;
-      return res.json({ success: true, provider, totalUsage: usage[provider].count, droplet: body.droplet });
-    }
-    
-    // POST /keys/:provider/rotate
-    const rotateMatch = path.match(/^\/keys\/([a-z]+)\/rotate$/);
-    if (rotateMatch && method === 'POST') {
-      const provider = rotateMatch[1];
-      if (!keys[provider]) {
-        return res.status(404).json({ error: 'Provider not found' });
-      }
-      const newKey = rotateKey(provider);
-      return res.json({ success: true, provider, rotatedAt: new Date().toISOString() });
-    }
-    
-    // GET /keys
-    if (path === '/keys' && method === 'GET') {
-      return res.json({
-        providers: Object.keys(keys),
-        rotationSchedule: { zai: '5 hours', others: 'manual' }
-      });
-    }
-    
-    return res.status(404).json({ error: 'Not found' });
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
-}
 
-async function parseBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(body));
-      } catch (e) {
-        reject(e);
+  try {
+    const url = new URL(req.url, `https://${req.headers.host || 'localhost'}`)
+    const path = url.pathname
+
+    if (path === '/health' && req.method === 'GET') {
+      return res.json({ status: 'ok' })
+    }
+
+    if (!authenticate(req, res)) return
+
+    if (path === '/keys' && req.method === 'GET') {
+      const providers = [...PROVIDERS].filter((provider) => providerKey(provider))
+      return res.json({ providers })
+    }
+
+    const keyMatch = path.match(/^\/keys\/([a-z]+)$/)
+    if (keyMatch && req.method === 'GET') {
+      const provider = keyMatch[1]
+      if (!PROVIDERS.has(provider)) return res.status(404).json({ error: 'provider not found' })
+      return res.json({ provider, configured: Boolean(providerKey(provider)) })
+    }
+
+    const usageMatch = path.match(/^\/keys\/([a-z]+)\/usage$/)
+    if (usageMatch && req.method === 'POST') {
+      const provider = usageMatch[1]
+      if (!PROVIDERS.has(provider)) return res.status(404).json({ error: 'provider not found' })
+      const body = await readJson(req)
+      if (!Number.isSafeInteger(body.tokens) || body.tokens < 0) {
+        return res.status(400).json({ error: 'invalid request' })
       }
-    });
-  });
+      return res.status(501).json({ error: 'durable usage tracking not configured' })
+    }
+
+    const rotateMatch = path.match(/^\/keys\/([a-z]+)\/rotate$/)
+    if (rotateMatch && req.method === 'POST') {
+      if (!PROVIDERS.has(rotateMatch[1])) {
+        return res.status(404).json({ error: 'provider not found' })
+      }
+      return res.status(501).json({ error: 'durable rotation not configured' })
+    }
+
+    return res.status(404).json({ error: 'not found' })
+  } catch {
+    return res.status(400).json({ error: 'invalid request' })
+  }
 }
