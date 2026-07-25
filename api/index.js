@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto'
 
 const PROVIDERS = new Set(['zai', 'anthropic', 'google', 'openai'])
 const MAX_BODY_BYTES = 4096
+const MIN_ADMIN_TOKEN_BYTES = 32
 
 function configuredOrigins() {
   return new Set(
@@ -25,7 +26,7 @@ function applyCors(req, res) {
 
 function authenticate(req, res) {
   const expected = process.env.KEY_MANAGER_ADMIN_TOKEN
-  if (!expected) {
+  if (!expected || Buffer.byteLength(expected) < MIN_ADMIN_TOKEN_BYTES) {
     res.status(503).json({ error: 'service unavailable' })
     return false
   }
@@ -73,6 +74,10 @@ export default async function handler(req, res) {
 
     if (path === '/health' && req.method === 'GET') {
       return res.json({ status: 'ok' })
+    }
+
+    if (req.headers.origin && !corsAllowed) {
+      return res.status(403).json({ error: 'origin not allowed' })
     }
 
     if (!authenticate(req, res)) return
