@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import test, { afterEach, beforeEach } from 'node:test'
 
@@ -78,6 +79,16 @@ test('key retrieval fails closed when server auth is not configured', async () =
 test('matching weak admin tokens fail closed as unavailable', async () => {
   process.env.KEY_MANAGER_ADMIN_TOKEN = 'short-token'
   const res = await invoke('GET', '/keys', { token: 'short-token' })
+  assert.equal(res.statusCode, 503)
+  assert.deepEqual(res.body, { error: 'service unavailable' })
+})
+
+test('the shipped example admin token cannot authenticate', async () => {
+  const example = await readFile(new URL('../.env.example', import.meta.url), 'utf8')
+  const configured = example.match(/^KEY_MANAGER_ADMIN_TOKEN=(.*)$/m)?.[1] ?? ''
+  process.env.KEY_MANAGER_ADMIN_TOKEN = configured
+
+  const res = await invoke('GET', '/keys', { token: configured })
   assert.equal(res.statusCode, 503)
   assert.deepEqual(res.body, { error: 'service unavailable' })
 })
